@@ -10,19 +10,21 @@ on:
 
 # 💡 ワークフロー全体で使用する環境変数
 env:
-  # 生成される結合テキストのファイル名
+  # 生成される結合テキストのファイル名。Gemini APIはこのファイルを入力として使用します
   OUTPUT_FILENAME: combined.txt
-  # 結合したファイルを保存するための専用ブランチ
+  # 結合ファイルを保存する専用ブランチ。メイン履歴を汚さずAIがアクセスしやすくします
   TARGET_BRANCH: combine-code
-  # AI解析用の対象拡張子
+  # 解析対象の拡張子。プロジェクト構成を把握するため設定ファイル (.vcxproj, .filters) を含めます
   TARGET_EXTENSIONS: .cpp,.h,.hpp,.vcxproj,.vcxproj.filters
-  # 除外ディレクトリ
-  EXCLUDE_DIRS: Resources,Novice,Adapter,DirectXTex,imgui,External
+  # 学生自身の成果物ではないディレクトリを除外。
+  # ※ Debugは学生がデバッグ用クラスを入れる可能性があるため除外リストから外しています。
+  EXCLUDE_DIRS: Resources,Novice,Adapter,DirectXTex,imgui,External,x64,Release,ipch
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     
+    # ターゲットブランチへのプッシュ（書き込み）権限
     permissions:
       contents: write 
 
@@ -30,20 +32,23 @@ jobs:
       - name: Checkout master
         uses: actions/checkout@v4 
 
-      # 1. ソースコード結合ファイルの生成 (Python)
+      # --- 1. Pythonによる高度なファイル結合 ---
       - name: Generate Code Summary
         id: generate
         shell: python
         run: |
           import os
           
+          # 環境変数から設定を取得
           target_extensions = tuple(os.environ['TARGET_EXTENSIONS'].split(','))
           exclude_dirs = set(os.environ['EXCLUDE_DIRS'].split(','))
           output_file = os.environ['OUTPUT_FILENAME']
           root_dir = '.'
-          exclude_dirs.update({'.git', '.github', '.vs', 'build', 'out'})
+          # システム系の除外ディレクトリを強制追加
+          exclude_dirs.update({'.git', '.github', '.vs', 'build', 'out', '.vscode'})
 
           def generate_tree_string(startpath):
+              """AIが物理フォルダ階層を一目で把握するためのツリーを生成"""
               tree_lines = ["### 🌳 Codebase File Tree (Physical Structure)\n"]
               for root, dirs, files in os.walk(startpath):
                   dirs[:] = [d for d in dirs if d not in exclude_dirs]
@@ -57,6 +62,7 @@ jobs:
               return "\n".join(tree_lines)
 
           with open(output_file, 'w', encoding='utf-8') as out:
+              # A. 最初に見るべき情報として物理ツリーを記述
               out.write(generate_tree_string(root_dir))
               out.write("\n\n" + "="*60 + "\nFILE CONTENTS START BELOW\n" + "="*60 + "\n\n")
 
@@ -67,35 +73,41 @@ jobs:
                       if file.endswith(target_extensions):
                           all_files.append(os.path.join(root, file))
 
-              # 設定ファイルを優先して並び替え
-              all_files.sort(key=lambda x: (not x.endswith('.vcxproj'), not x.endswith('.filters'), x))
+              # B. 設定ファイルを先頭に配置（AIが先に構成とフィルタ設定を理解するため）
+              all_files.sort(key=lambda x: (
+                  not x.endswith('.vcxproj'), 
+                  not x.endswith('.filters'), 
+                  x
+              ))
 
               for path in all_files:
                   rel_path = os.path.relpath(path, root_dir)
                   try:
-                      with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                      # Shift-JIS等の混在を考慮し、UTF-8(BOM付対応)で読み込み。エラー時は置換して継続。
+                      with open(path, 'r', encoding='utf-8-sig', errors='replace') as f:
                           content = f.read()
+                          # path属性を付与することで、AIが物理階層と論理フィルタを正確に比較可能にする
                           out.write(f'<file_content path="{rel_path}">\n')
                           out.write(content)
                           out.write(f'\n</file_content>\n\n')
                   except Exception as e:
                       print(f"Error reading {rel_path}: {e}")
 
-      # 2. ターゲットブランチへの安全な公開 (Shell)
+      # --- 2. 安全なブランチ切り替えとプッシュ ---
       - name: Publish to Target Branch
         env:
-          # GitHub変数をシェルの環境変数として安全に受け渡す
+          # GitHubコンテキストをシェル変数に変換（構文エラー回避のベストプラクティス）
           OUT_FILE: ${{ env.OUTPUT_FILENAME }}
           TGT_BR: ${{ env.TARGET_BRANCH }}
           G_SHA: ${{ github.sha }}
         run: |
-          # A. 一時待避（シェル変数として参照）
+          # A. ブランチ切り替え時の競合を避けるため、生成ファイルを一時退避
           cp "$OUT_FILE" "/tmp/$OUT_FILE"
           
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # B. ブランチ切り替え
+          # B. ターゲットブランチの準備（存在しなければorphanで新規作成）
           if git fetch origin "$TGT_BR"; then
             git checkout -f "$TGT_BR"
             git pull origin "$TGT_BR"
@@ -104,7 +116,7 @@ jobs:
             git rm -rf .
           fi
           
-          # C. ファイル復元とプッシュ
+          # C. ファイルを復元してコミット
           mv "/tmp/$OUT_FILE" .
           git add "$OUT_FILE"
           
