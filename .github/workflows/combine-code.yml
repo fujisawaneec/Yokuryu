@@ -8,23 +8,22 @@ on:
   # Actionsタブから手動での実行も可能にする
   workflow_dispatch:
 
-# 💡 ワークフロー全体で使用する環境変数
+# 💡 ワークフロー全体で使用する設定
 env:
-  # 生成される結合テキストのファイル名。Gemini APIはこのファイルを入力として使用します
+  # 生成される結合テキスト名。Geminiはこの1ファイルを読むだけでプロジェクト全体を把握できます
   OUTPUT_FILENAME: combined.txt
-  # 結合ファイルを保存する専用ブランチ。メイン履歴を汚さずAIがアクセスしやすくします
+  # 結合ファイルを保存する専用ブランチ。masterの履歴を汚さず、AI用の「最新スナップショット」として運用します
   TARGET_BRANCH: combine-code
-  # 解析対象の拡張子。プロジェクト構成を把握するため設定ファイル (.vcxproj, .filters) を含めます
+  # 解析対象。プロジェクトの「論理構造」をAIに教えるため .vcxproj と .filters を含めるのが重要です
   TARGET_EXTENSIONS: .cpp,.h,.hpp,.vcxproj,.vcxproj.filters
-  # 学生自身の成果物ではないディレクトリを除外。
-  # ※ Debugは学生がデバッグ用クラスを入れる可能性があるため除外リストから外しています。
+  # 学生の成果物ではない外部コードを除外。Debugフォルダはソースが含まれる可能性があるため除外しません
   EXCLUDE_DIRS: Resources,Novice,Adapter,DirectXTex,imgui,External,x64,Release,ipch
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     
-    # ターゲットブランチへのプッシュ（書き込み）権限
+    # ターゲットブランチへの書き込み権限
     permissions:
       contents: write 
 
@@ -32,7 +31,7 @@ jobs:
       - name: Checkout master
         uses: actions/checkout@v4 
 
-      # --- 1. Pythonによる高度なファイル結合 ---
+      # --- 1. Pythonによる文字化け対策込みの高度なファイル結合 ---
       - name: Generate Code Summary
         id: generate
         shell: python
@@ -44,85 +43,93 @@ jobs:
           exclude_dirs = set(os.environ['EXCLUDE_DIRS'].split(','))
           output_file = os.environ['OUTPUT_FILENAME']
           root_dir = '.'
-          # システム系の除外ディレクトリを強制追加
+          # GitやIDEの管理用ディレクトリを強制除外
           exclude_dirs.update({'.git', '.github', '.vs', 'build', 'out', '.vscode'})
 
-          def generate_tree_string(startpath):
-              """AIが物理フォルダ階層を一目で把握するためのツリーを生成"""
-              tree_lines = ["### 🌳 Codebase File Tree (Physical Structure)\n"]
+          def read_file_safe(path):
+              """
+              日本のVisual Studio環境特有のShift-JIS(CP932)とUTF-8の混在を解決して読み込む。
+              日本語コメントの文字化けを防ぎ、AIが正しく読めるUTF-8へ変換します。
+              """
+              encodings = ['utf-8-sig', 'cp932', 'utf-8']
+              for enc in encodings:
+                  try:
+                      with open(path, 'r', encoding=enc) as f:
+                          return f.read()
+                  except (UnicodeDecodeError, UnicodeError):
+                      continue
+              # すべての試行が失敗した場合は、壊れた文字を代替文字に置き換えて強制読み込み
+              with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                  return f.read()
+
+          def generate_tree(startpath):
+              """物理的なフォルダ構造を可視化。AIが「どのファイルがどこにあるか」を把握する起点になります"""
+              lines = ["### 🌳 Codebase File Tree (Physical Structure)\n"]
               for root, dirs, files in os.walk(startpath):
                   dirs[:] = [d for d in dirs if d not in exclude_dirs]
                   level = root.replace(startpath, '').count(os.sep)
                   indent = '│   ' * level
-                  tree_lines.append(f"{indent}├── {os.path.basename(root) or '.'}/")
-                  sub_indent = '│   ' * (level + 1)
+                  lines.append(f"{indent}├── {os.path.basename(root) or '.'}/")
                   for f in files:
                       if f.endswith(target_extensions):
-                          tree_lines.append(f"{sub_indent}└── {f}")
-              return "\n".join(tree_lines)
+                          lines.append(f"{'│   ' * (level + 1)}└── {f}")
+              return "\n".join(lines)
 
+          # 結合ファイルの作成開始
           with open(output_file, 'w', encoding='utf-8') as out:
-              # A. 最初に見るべき情報として物理ツリーを記述
-              out.write(generate_tree_string(root_dir))
+              # A. 物理構造を最上部に記述
+              out.write(generate_tree(root_dir))
               out.write("\n\n" + "="*60 + "\nFILE CONTENTS START BELOW\n" + "="*60 + "\n\n")
 
-              all_files = []
+              all_paths = []
               for root, dirs, files in os.walk(root_dir):
                   dirs[:] = [d for d in dirs if d not in exclude_dirs]
-                  for file in files:
-                      if file.endswith(target_extensions):
-                          all_files.append(os.path.join(root, file))
+                  for f in files:
+                      if f.endswith(target_extensions):
+                          all_paths.append(os.path.join(root, f))
 
-              # B. 設定ファイルを先頭に配置（AIが先に構成とフィルタ設定を理解するため）
-              all_files.sort(key=lambda x: (
-                  not x.endswith('.vcxproj'), 
-                  not x.endswith('.filters'), 
-                  x
-              ))
+              # B. 設定ファイルを先頭に配置。AIが「構成」を理解した後に「実装」を読む流れを作ります
+              all_paths.sort(key=lambda x: (not x.endswith('.vcxproj'), not x.endswith('.filters'), x))
 
-              for path in all_files:
+              for path in all_paths:
                   rel_path = os.path.relpath(path, root_dir)
-                  try:
-                      # Shift-JIS等の混在を考慮し、UTF-8(BOM付対応)で読み込み。エラー時は置換して継続。
-                      with open(path, 'r', encoding='utf-8-sig', errors='replace') as f:
-                          content = f.read()
-                          # path属性を付与することで、AIが物理階層と論理フィルタを正確に比較可能にする
-                          out.write(f'<file_content path="{rel_path}">\n')
-                          out.write(content)
-                          out.write(f'\n</file_content>\n\n')
-                  except Exception as e:
-                      print(f"Error reading {rel_path}: {e}")
+                  content = read_file_safe(path)
+                  # XMLタグによるカプセル化。AIがファイル境界を100%正確に識別できます
+                  out.write(f'<file_content path="{rel_path}">\n')
+                  out.write(content)
+                  out.write(f'\n</file_content>\n\n')
 
-      # --- 2. 安全なブランチ切り替えとプッシュ ---
+      # --- 2. 安全なブランチ公開処理 ---
       - name: Publish to Target Branch
         env:
-          # GitHubコンテキストをシェル変数に変換（構文エラー回避のベストプラクティス）
-          OUT_FILE: ${{ env.OUTPUT_FILENAME }}
-          TGT_BR: ${{ env.TARGET_BRANCH }}
-          G_SHA: ${{ github.sha }}
+          # 変数展開のミスを防ぐため、一度シェル環境変数に格納
+          OUT_F: ${{ env.OUTPUT_FILENAME }}
+          TGT_B: ${{ env.TARGET_BRANCH }}
+          SHA: ${{ github.sha }}
         run: |
-          # A. ブランチ切り替え時の競合を避けるため、生成ファイルを一時退避
-          cp "$OUT_FILE" "/tmp/$OUT_FILE"
+          # ファイルを一時領域に退避（Gitのブランチ切り替え時の競合を完全に回避）
+          cp "$OUT_F" "/tmp/$OUT_F"
           
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # B. ターゲットブランチの準備（存在しなければorphanで新規作成）
-          if git fetch origin "$TGT_BR"; then
-            git checkout -f "$TGT_BR"
-            git pull origin "$TGT_BR"
+          # ターゲットブランチが存在するか確認
+          if git fetch origin "$TGT_B"; then
+            git checkout -f "$TGT_B"
+            git pull origin "$TGT_B"
           else
-            git checkout --orphan "$TGT_BR"
+            # 初回は履歴を持たない独立ブランチ(orphan)を作成
+            git checkout --orphan "$TGT_B"
             git rm -rf .
           fi
           
-          # C. ファイルを復元してコミット
-          mv "/tmp/$OUT_FILE" .
-          git add "$OUT_FILE"
+          # 退避したファイルを復元してコミット
+          mv "/tmp/$OUT_F" .
+          git add "$OUT_F"
           
           if ! git diff --cached --exit-code; then
-            git commit -m "Auto: Update combined code for AI review ($G_SHA)"
-            git push origin "$TGT_BR"
+            git commit -m "Auto: Update combined code for AI review ($SHA)"
+            git push origin "$TGT_B"
           else
             echo "No changes to commit"
           fi
