@@ -1,44 +1,42 @@
 name: Generate & Publish Combined Code File
 
 on:
+  # masterブランチへのプッシュ時に自動実行
   push:
     branches:
       - master
-  # 手動実行を可能にする
+  # Actionsタブから手動での実行も可能にする
   workflow_dispatch:
 
 # 💡 ワークフロー全体で使用する環境変数
 env:
-  # 出力ファイル名
+  # 生成される結合テキストのファイル名
   OUTPUT_FILENAME: combined.txt
-  # 出力先ブランチ名
+  # 結合したファイルを保存するための専用ブランチ
   TARGET_BRANCH: combine-code
-  # ターゲット拡張子
+  # AI解析用の対象拡張子
   TARGET_EXTENSIONS: .cpp,.h,.hpp,.vcxproj,.vcxproj.filters
   # 除外ディレクトリ
-  EXCLUDE_DIRS: externals,resources
+  EXCLUDE_DIRS: Resources,Novice,Adapter,DirectXTex,imgui,External
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     
-    # 💡 ターゲットブランチへのプッシュに必要な書き込み権限を付与
     permissions:
       contents: write 
 
     steps:
-      - name: Checkout master (Shallow depth)
-        # 結合するコードを取得（デフォルトでshallow clone）
+      - name: Checkout master
         uses: actions/checkout@v4 
 
-      # 1. ソースコード結合ファイルの生成
+      # 1. ソースコード結合ファイルの生成 (Python)
       - name: Generate Code Summary
         id: generate
         shell: python
         run: |
           import os
           
-          # --- 環境変数からの設定読み込み ---
           target_extensions = tuple(os.environ['TARGET_EXTENSIONS'].split(','))
           exclude_dirs = set(os.environ['EXCLUDE_DIRS'].split(','))
           output_file = os.environ['OUTPUT_FILENAME']
@@ -50,81 +48,69 @@ jobs:
               for root, dirs, files in os.walk(startpath):
                   dirs[:] = [d for d in dirs if d not in exclude_dirs]
                   level = root.replace(startpath, '').count(os.sep)
-                  indent = '│   ' * (level)
-                  tree_lines.append(f'{indent}├── {os.path.basename(root)}/')
+                  indent = '│   ' * level
+                  tree_lines.append(f"{indent}├── {os.path.basename(root) or '.'}/")
                   sub_indent = '│   ' * (level + 1)
                   for f in files:
                       if f.endswith(target_extensions):
-                          tree_lines.append(f'{sub_indent}└── {f}')
+                          tree_lines.append(f"{sub_indent}└── {f}")
               return "\n".join(tree_lines)
 
-          def generate_summary():
-              with open(output_file, 'w', encoding='utf-8') as out:
-                  # A. ツリー構造（物理階層の把握用）
-                  out.write(generate_tree_string(root_dir))
-                  out.write("\n\n" + "="*60 + "\n")
-                  out.write("FILE CONTENTS START BELOW\n")
-                  out.write("="*60 + "\n\n")
+          with open(output_file, 'w', encoding='utf-8') as out:
+              out.write(generate_tree_string(root_dir))
+              out.write("\n\n" + "="*60 + "\nFILE CONTENTS START BELOW\n" + "="*60 + "\n\n")
 
-                  # B. ファイル収集
-                  all_files_paths = []
-                  for root, dirs, files in os.walk(root_dir):
-                      dirs[:] = [d for d in dirs if d not in exclude_dirs]
-                      for file in files:
-                          if file.endswith(target_extensions):
-                              all_files_paths.append(os.path.join(root, file))
+              all_files = []
+              for root, dirs, files in os.walk(root_dir):
+                  dirs[:] = [d for d in dirs if d not in exclude_dirs]
+                  for file in files:
+                      if file.endswith(target_extensions):
+                          all_files.append(os.path.join(root, file))
 
-                  # C. 設定ファイルを先に、ソースコードを後に並び替え
-                  # AIが「プロジェクトの構成（フィルタ）」を先に読んでから「中身」を読めるようにする
-                  all_files_paths.sort(key=lambda x: (
-                      not x.endswith('.vcxproj'), 
-                      not x.endswith('.filters'), 
-                      x
-                  ))
+              # 設定ファイルを優先して並び替え
+              all_files.sort(key=lambda x: (not x.endswith('.vcxproj'), not x.endswith('.filters'), x))
 
-                  # D. XMLタグ形式で書き出し
-                  for path in all_files_paths:
-                      rel_path = os.path.relpath(path, root_dir)
-                      try:
-                          with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                              content = f.read()
-                              # <file_content>タグで囲むことでAIが境界を100%誤認しなくなる
-                              out.write(f'<file_content path="{rel_path}">\n')
-                              out.write(content)
-                              out.write(f'\n</file_content>\n\n')
-                      except Exception as e:
-                          print(f"Failed to read {rel_path}: {e}")
+              for path in all_files:
+                  rel_path = os.path.relpath(path, root_dir)
+                  try:
+                      with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                          content = f.read()
+                          out.write(f'<file_content path="{rel_path}">\n')
+                          out.write(content)
+                          out.write(f'\n</file_content>\n\n')
+                  except Exception as e:
+                      print(f"Error reading {rel_path}: {e}")
 
-          generate_summary()
-
-      # 2. ターゲットブランチへファイルを公開
+      # 2. ターゲットブランチへの安全な公開 (Shell)
       - name: Publish to Target Branch
+        env:
+          # GitHub変数をシェルの環境変数として安全に受け渡す
+          OUT_FILE: ${{ env.OUTPUT_FILENAME }}
+          TGT_BR: ${{ env.TARGET_BRANCH }}
+          G_SHA: ${{ github.sha }}
         run: |
-          # 出力ファイルを一時退避
-          cp "$OUTPUT_FILENAME" /tmp/"$OUTPUT_FILENAME"
+          # A. 一時待避（シェル変数として参照）
+          cp "$OUT_FILE" "/tmp/$OUT_FILE"
           
-          # ターゲットブランチの存在確認と切り替え
-          if git fetch origin "$TARGET_BRANCH"; then
-            git checkout "$TARGET_BRANCH"
-            git pull origin "$TARGET_BRANCH"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # B. ブランチ切り替え
+          if git fetch origin "$TGT_BR"; then
+            git checkout -f "$TGT_BR"
+            git pull origin "$TGT_BR"
           else
-            # 初回作成時は orphan ブランチで履歴を汚さず作成
-            git checkout --orphan "$TARGET_BRANCH"
+            git checkout --orphan "$TGT_BR"
             git rm -rf .
           fi
           
-          # ファイルの復元
-          mv /tmp/"$OUTPUT_FILENAME" .
+          # C. ファイル復元とプッシュ
+          mv "/tmp/$OUT_FILE" .
+          git add "$OUT_FILE"
           
-          # コミットとプッシュ
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "$OUTPUT_FILENAME"
-          
-          # 差分がある場合のみコミット
           if ! git diff --cached --exit-code; then
-            git commit -m "Auto: Update combined code for AI review (${{ github.sha }})"
-            git push origin "$TARGET_BRANCH"
+            git commit -m "Auto: Update combined code for AI review ($G_SHA)"
+            git push origin "$TGT_BR"
           else
             echo "No changes to commit"
           fi
